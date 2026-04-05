@@ -9,9 +9,23 @@ import SwiftUI
 
 @main
 struct DockinApp: App {
+    @StateObject private var model = DockGuardModel()
+
     var body: some Scene {
-        WindowGroup {
-            ContentView()
+        MenuBarExtra {
+            ContentView(model: model)
+                .preferredColorScheme(model.preferredColorScheme)
+        } label: {
+            Image(nsImage: DockinIcon.menuBarImage())
+                .accessibilityLabel("Dockin")
         }
+        .menuBarExtraStyle(.window)
+
+        Window("Dockin", id: "main") {
+            ContentView(model: model)
+                .preferredColorScheme(model.preferredColorScheme)
+                .frame(minWidth: 380)
+        }
+        .defaultSize(width: 400, height: 540)
     }
 }
