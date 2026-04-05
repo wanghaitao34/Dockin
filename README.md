@@ -6,6 +6,10 @@ Dockin is a lightweight macOS menu bar utility that keeps the Dock effectively p
 
 Instead of modifying the Dock process, Dockin prevents accidental Dock reveals on non-target displays by intercepting pointer movement near the active Dock edge and gently redirecting the cursor before the Dock trigger zone is reached.
 
+<p align="center">
+  <img src="docs/images/README-screenshot.png" alt="Dockin screenshot" width="860" />
+</p>
+
 ## English
 
 ### Overview
