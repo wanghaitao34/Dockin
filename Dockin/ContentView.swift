@@ -42,16 +42,6 @@ struct ContentView: View {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Text(model.strings.edgeBounceDistance)
-                            Spacer()
-                            Text("\(Int(model.safeInset)) px")
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Slider(value: $model.safeInset, in: 10 ... 32, step: 1)
-
                         preferenceRow(model.strings.currentDockPosition) {
                             Text(model.dockEdgeTitle)
                                 .foregroundStyle(.secondary)

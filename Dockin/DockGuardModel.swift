@@ -11,6 +11,64 @@ import Combine
 import ServiceManagement
 import SwiftUI
 
+// Bottom-edge guarding feels smoother when the pointer is clamped in the input event
+// itself instead of being warped back on a polling timer.
+nonisolated(unsafe) private var bottomGuardTargetDisplayID: CGDirectDisplayID = CGMainDisplayID()
+nonisolated(unsafe) private var bottomGuardEnabled = false
+nonisolated(unsafe) private var bottomGuardThreshold: CGFloat = 5
+nonisolated(unsafe) private var bottomGuardEventTap: CFMachPort?
+
+nonisolated(unsafe) private let bottomGuardEventTapCallback: CGEventTapCallBack = { _, type, event, _ in
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        if let tap = bottomGuardEventTap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+
+        return Unmanaged.passUnretained(event)
+    }
+
+    guard bottomGuardEnabled else {
+        return Unmanaged.passUnretained(event)
+    }
+
+    var totalCount: UInt32 = 0
+    CGGetActiveDisplayList(0, nil, &totalCount)
+    guard totalCount > 1 else {
+        return Unmanaged.passUnretained(event)
+    }
+
+    let mouseLocation = event.location
+
+    var displayCount: UInt32 = 0
+    var currentDisplayID: CGDirectDisplayID = 0
+    CGGetDisplaysWithPoint(mouseLocation, 1, &currentDisplayID, &displayCount)
+
+    guard displayCount > 0, currentDisplayID != bottomGuardTargetDisplayID else {
+        return Unmanaged.passUnretained(event)
+    }
+
+    let displayBounds = CGDisplayBounds(currentDisplayID)
+    let bottomEdge = displayBounds.origin.y + displayBounds.size.height
+
+    guard mouseLocation.y >= bottomEdge - bottomGuardThreshold else {
+        return Unmanaged.passUnretained(event)
+    }
+
+    let pointBelow = CGPoint(x: mouseLocation.x, y: bottomEdge + 1)
+    var belowCount: UInt32 = 0
+    CGGetDisplaysWithPoint(pointBelow, 1, nil, &belowCount)
+
+    if belowCount > 0 {
+        return Unmanaged.passUnretained(event)
+    }
+
+    var clampedLocation = mouseLocation
+    clampedLocation.y = bottomEdge - bottomGuardThreshold - 1
+    event.location = clampedLocation
+
+    return Unmanaged.passUnretained(event)
+}
+
 struct DisplayInfo: Identifiable, Hashable {
     let id: CGDirectDisplayID
     let name: String
@@ -39,16 +97,13 @@ final class DockGuardModel: ObservableObject {
     @Published var isEnabled: Bool {
         didSet {
             defaults.set(isEnabled, forKey: Keys.isEnabled)
+            syncGuardConfiguration()
         }
     }
     @Published var selectedDisplayRawID: Int {
         didSet {
             defaults.set(selectedDisplayRawID, forKey: Keys.selectedDisplayID)
-        }
-    }
-    @Published var safeInset: Double {
-        didSet {
-            defaults.set(safeInset, forKey: Keys.safeInset)
+            syncGuardConfiguration()
         }
     }
     @Published var language: AppLanguage {
@@ -68,12 +123,14 @@ final class DockGuardModel: ObservableObject {
     private var screenObserver: NSObjectProtocol?
     private var dockObserver: NSObjectProtocol?
     private var localeObserver: NSObjectProtocol?
+    private var bottomGuardRunLoopSource: CFRunLoopSource?
+    private let edgeBounceDistance: Double = 5
+    private let edgeTriggerDistance: Double = 4
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.isEnabled = defaults.object(forKey: Keys.isEnabled) as? Bool ?? true
         self.selectedDisplayRawID = defaults.integer(forKey: Keys.selectedDisplayID)
-        self.safeInset = defaults.object(forKey: Keys.safeInset) as? Double ?? 14
         self.language = AppLanguage(rawValue: defaults.string(forKey: Keys.language) ?? "") ?? .system
         self.appearance = AppAppearance(rawValue: defaults.string(forKey: Keys.appearance) ?? "") ?? .system
 
@@ -82,10 +139,23 @@ final class DockGuardModel: ObservableObject {
         refreshLaunchAtLoginState()
         installObservers()
         startMonitoring()
+        syncGuardConfiguration()
     }
 
     deinit {
         timer?.invalidate()
+        bottomGuardEnabled = false
+
+        if let tap = bottomGuardEventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+
+        if let source = bottomGuardRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+        }
+
+        bottomGuardEventTap = nil
+        bottomGuardRunLoopSource = nil
 
         if let screenObserver {
             NotificationCenter.default.removeObserver(screenObserver)
@@ -194,6 +264,8 @@ final class DockGuardModel: ObservableObject {
         if selectedDisplayRawID == 0, let mainDisplay = updated.first(where: { $0.id == CGMainDisplayID() }) ?? updated.first {
             selectedDisplayRawID = Int(mainDisplay.id)
         }
+
+        syncGuardConfiguration()
     }
 
     func badgeText(for display: DisplayInfo) -> String {
@@ -268,6 +340,7 @@ final class DockGuardModel: ObservableObject {
     private func refreshDockEdge() {
         let dockDefaults = UserDefaults(suiteName: "com.apple.dock")
         dockEdge = DockEdge(rawValue: dockDefaults?.string(forKey: "orientation") ?? "") ?? .bottom
+        syncGuardConfiguration()
     }
 
     private func refreshLanguageIfNeeded() {
@@ -321,6 +394,10 @@ final class DockGuardModel: ObservableObject {
             return
         }
 
+        if dockEdge == .bottom, bottomGuardRunLoopSource != nil {
+            return
+        }
+
         let mouseLocation = NSEvent.mouseLocation
 
         guard let hoveredDisplay = display(containing: mouseLocation), hoveredDisplay.id != selectedDisplay.id else {
@@ -350,15 +427,13 @@ final class DockGuardModel: ObservableObject {
     }
 
     private func shouldBlock(_ point: CGPoint, inside frame: CGRect) -> Bool {
-        let triggerDistance = max(6, min(safeInset - 4, 18))
-
         switch dockEdge {
         case .bottom:
-            return point.y - frame.minY <= triggerDistance
+            return point.y - frame.minY <= edgeTriggerDistance
         case .left:
-            return point.x - frame.minX <= triggerDistance
+            return point.x - frame.minX <= edgeTriggerDistance
         case .right:
-            return frame.maxX - point.x <= triggerDistance
+            return frame.maxX - point.x <= edgeTriggerDistance
         }
     }
 
@@ -371,22 +446,84 @@ final class DockGuardModel: ObservableObject {
         switch dockEdge {
         case .bottom:
             targetPoint = CGPoint(
-                x: clamp(localX, min: safeInset, max: display.frame.width - safeInset),
-                y: display.frame.height - safeInset
+                x: clamp(localX, min: edgeBounceDistance, max: display.frame.width - edgeBounceDistance),
+                y: display.frame.height - edgeBounceDistance
             )
         case .left:
             targetPoint = CGPoint(
-                x: safeInset,
-                y: clamp(localYFromTop, min: safeInset, max: display.frame.height - safeInset)
+                x: edgeBounceDistance,
+                y: clamp(localYFromTop, min: edgeBounceDistance, max: display.frame.height - edgeBounceDistance)
             )
         case .right:
             targetPoint = CGPoint(
-                x: display.frame.width - safeInset,
-                y: clamp(localYFromTop, min: safeInset, max: display.frame.height - safeInset)
+                x: display.frame.width - edgeBounceDistance,
+                y: clamp(localYFromTop, min: edgeBounceDistance, max: display.frame.height - edgeBounceDistance)
             )
         }
 
         _ = CGDisplayMoveCursorToPoint(display.id, targetPoint)
+    }
+
+    private func syncGuardConfiguration() {
+        if let selectedDisplay {
+            bottomGuardTargetDisplayID = selectedDisplay.id
+        }
+
+        bottomGuardThreshold = CGFloat(edgeBounceDistance)
+
+        if isActivelyGuarding, dockEdge == .bottom {
+            startBottomGuardEventTap()
+        } else {
+            stopBottomGuardEventTap()
+        }
+    }
+
+    private func startBottomGuardEventTap() {
+        guard bottomGuardRunLoopSource == nil else {
+            bottomGuardEnabled = true
+            return
+        }
+
+        let eventMask: CGEventMask =
+            (1 << CGEventType.mouseMoved.rawValue)
+            | (1 << CGEventType.leftMouseDragged.rawValue)
+            | (1 << CGEventType.rightMouseDragged.rawValue)
+            | (1 << CGEventType.otherMouseDragged.rawValue)
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cghidEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventMask,
+            callback: bottomGuardEventTapCallback,
+            userInfo: nil
+        ) else {
+            bottomGuardEnabled = false
+            return
+        }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+
+        bottomGuardEventTap = tap
+        bottomGuardRunLoopSource = source
+        bottomGuardEnabled = true
+    }
+
+    private func stopBottomGuardEventTap() {
+        bottomGuardEnabled = false
+
+        if let tap = bottomGuardEventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+
+        if let source = bottomGuardRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+        }
+
+        bottomGuardEventTap = nil
+        bottomGuardRunLoopSource = nil
     }
 
     private func clamp(_ value: Double, min lowerBound: Double, max upperBound: Double) -> Double {
@@ -414,7 +551,6 @@ final class DockGuardModel: ObservableObject {
 private enum Keys {
     static let isEnabled = "isEnabled"
     static let selectedDisplayID = "selectedDisplayID"
-    static let safeInset = "safeInset"
     static let language = "language"
     static let appearance = "appearance"
 }
